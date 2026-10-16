@@ -548,6 +548,84 @@ static int host_err_open(char* tmp, size_t n) {
   return open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
 }
 
+#if defined(__MSYS__)
+// A native Windows program (claude.exe, codex.exe) cannot read an MSYS
+// socketpair as its stdin (it fails with EISDIR). The child gets real pipes
+// instead, and this thread relays them to the hub's end of the socketpair:
+// what the hub writes goes to the child's stdin, what the child writes
+// (stdout, and stderr when joined) goes back to the hub.
+typedef struct {
+  int sock, to_child, from_child;
+} HostRelay;
+
+static int host_write_all(int fd, const char* b, ssize_t n) {
+  while (n > 0) {
+    ssize_t k = write(fd, b, (size_t)n);
+    if (k < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    b += k;
+    n -= k;
+  }
+  return 0;
+}
+
+static void* host_relay(void* arg) {
+  HostRelay r = *(HostRelay*)arg;
+  free(arg);
+  char buf[65536];
+  // the hub's end may close only its writing side (it has sent all it will):
+  // the child's stdin then ends, but its output still goes back
+  int hub_in = 1;      // the hub may still send
+  int child_out = 1;   // the child may still write
+  int in_open = 1;     // the child's stdin is open
+  int hub_alive = 1;   // the hub's end can still be written to
+  while (hub_in || child_out) {
+    struct pollfd fds[2];
+    int n = 0, si = -1, ci = -1;
+    if (hub_in) { fds[n].fd = r.sock; fds[n].events = POLLIN; fds[n].revents = 0; si = n++; }
+    if (child_out) { fds[n].fd = r.from_child; fds[n].events = POLLIN; fds[n].revents = 0; ci = n++; }
+    if (poll(fds, (nfds_t)n, -1) < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (si >= 0 && (fds[si].revents & (POLLIN | POLLHUP | POLLERR))) {
+      ssize_t k = read(r.sock, buf, sizeof buf);
+      if (k > 0) {
+        if (in_open && host_write_all(r.to_child, buf, k) < 0) {
+          // the child closed its stdin: later input is dropped
+          close(r.to_child);
+          in_open = 0;
+        }
+      } else if (k == 0 || (errno != EINTR && errno != EAGAIN)) {
+        hub_in = 0;
+        if (in_open) { close(r.to_child); in_open = 0; }
+      }
+    }
+    if (ci >= 0 && (fds[ci].revents & (POLLIN | POLLHUP | POLLERR))) {
+      ssize_t k = read(r.from_child, buf, sizeof buf);
+      if (k > 0) {
+        if (hub_alive && host_write_all(r.sock, buf, k) < 0) {
+          hub_alive = 0;
+        }
+      } else if (k == 0 || (errno != EINTR && errno != EAGAIN)) {
+        child_out = 0;
+        close(r.from_child);
+        // the child has ended: the hub's reader sees the end of the stream
+        shutdown(r.sock, SHUT_WR);
+      }
+    }
+  }
+  if (in_open) close(r.to_child);
+  if (child_out) close(r.from_child);
+  // let the hub read what is queued before the socket goes
+  usleep(300000);
+  close(r.sock);
+  return NULL;
+}
+#endif
+
 // Starts cmd (searched on PATH) in cwd. Its stdin and stdout are one end of
 // a socketpair; we keep the other, non-blocking. stderr: 0 discards it, 1
 // joins it to stdout, 2 inherits ours, 3 goes to a file read back by
@@ -568,17 +646,30 @@ Term proc_spawn_run(Env e, Term* f, IoWork* w) {
   } else if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
     code = errno;
   } else {
+    int c_in = sv[1], c_out = sv[1];
+#if defined(__MSYS__)
+    int in_p[2] = { -1, -1 }, out_p[2] = { -1, -1 };
+    if (pipe(in_p) < 0 || pipe(out_p) < 0) {
+      code = errno;
+      if (in_p[0] >= 0) { close(in_p[0]); close(in_p[1]); }
+      close(sv[0]);
+      close(sv[1]);
+      goto spawn_done;
+    }
+    c_in = in_p[0];
+    c_out = out_p[1];
+#endif
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     if (clen > 0) {
       posix_spawn_file_actions_addchdir_np(&fa, cwd);
     }
-    posix_spawn_file_actions_adddup2(&fa, sv[1], 0);
-    posix_spawn_file_actions_adddup2(&fa, sv[1], 1);
+    posix_spawn_file_actions_adddup2(&fa, c_in, 0);
+    posix_spawn_file_actions_adddup2(&fa, c_out, 1);
     if (err == 0) {
       posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
     } else if (err == 1) {
-      posix_spawn_file_actions_adddup2(&fa, sv[1], 2);
+      posix_spawn_file_actions_adddup2(&fa, c_out, 2);
     } else if (err == 3) {
       // stderr to a file of its own, named for the pid once it is known
       // (Proc.errtail reads its end and removes it)
@@ -590,11 +681,20 @@ Term proc_spawn_run(Env e, Term* f, IoWork* w) {
       }
     }
     posix_spawn_file_actions_addclose(&fa, sv[0]);
+#if defined(__MSYS__)
+    posix_spawn_file_actions_addclose(&fa, sv[1]);
+    posix_spawn_file_actions_addclose(&fa, in_p[1]);
+    posix_spawn_file_actions_addclose(&fa, out_p[0]);
+    if (c_in > 2) posix_spawn_file_actions_addclose(&fa, c_in);
+    if (c_out > 2) posix_spawn_file_actions_addclose(&fa, c_out);
+#endif
     // the child keeps only the copies on 0-2: left open, a process it puts
     // in the background would hold the pipe, and the caller never sees EOF
+#if !defined(__MSYS__)
     if (sv[1] > 2) {
       posix_spawn_file_actions_addclose(&fa, sv[1]);
     }
+#endif
     posix_spawnattr_t at;
     posix_spawnattr_init(&at);
     sigset_t def;
@@ -605,7 +705,32 @@ Term proc_spawn_run(Env e, Term* f, IoWork* w) {
     code = posix_spawnp(&pid, argv[0], &fa, &at, argv, environ);
     posix_spawn_file_actions_destroy(&fa);
     posix_spawnattr_destroy(&at);
+#if defined(__MSYS__)
+    // the parent keeps the other ends: a relay thread joins them to the socket
+    close(in_p[0]);
+    close(out_p[1]);
+    if (code == 0) {
+      HostRelay* rl = malloc(sizeof *rl);
+      pthread_t th;
+      if (rl != NULL) {
+        rl->sock = sv[1];
+        rl->to_child = in_p[1];
+        rl->from_child = out_p[0];
+        if (pthread_create(&th, NULL, host_relay, rl) == 0) {
+          pthread_detach(th);
+        } else {
+          free(rl);
+          close(sv[1]); close(in_p[1]); close(out_p[0]);
+        }
+      } else {
+        close(sv[1]); close(in_p[1]); close(out_p[0]);
+      }
+    } else {
+      close(sv[1]); close(in_p[1]); close(out_p[0]);
+    }
+#else
     close(sv[1]);
+#endif
     if (errfd >= 0) {
       close(errfd);
       char at[4200];
@@ -619,6 +744,9 @@ Term proc_spawn_run(Env e, Term* f, IoWork* w) {
       fcntl(sv[0], F_SETFD, FD_CLOEXEC);
     }
   }
+#if defined(__MSYS__)
+spawn_done:
+#endif
   for (char** a = argv; *a != NULL; a += 1) {
     free(*a);
   }
