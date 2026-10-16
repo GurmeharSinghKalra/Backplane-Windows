@@ -44,7 +44,9 @@ static void __attribute__((constructor)) pty_resize_use(void) {
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#if defined(__linux__)
 #include <sys/syscall.h>
+#endif
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>

@@ -1789,6 +1789,773 @@ static void __attribute__((constructor)) win_title_use(void) {
 
 #endif
 
+#elif defined(__MSYS__) || defined(_WIN32)
+
+// Native Windows window (MSYS2 build). The same effects, five-word events
+// and payloads as the X11 window above. A window thread runs the Win32
+// message loop and queues events; the Bend side waits on a pipe the thread
+// writes to. A frame is the Bend Image quadtree, drawn whole into a top-down
+// 32-bit buffer and blitted on WM_PAINT. The input method is not used yet:
+// composed text arrives as WM_CHAR commits; preedit is not shown.
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <windowsx.h>
+#include <shellapi.h>
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <poll.h>
+#include <unistd.h>
+
+typedef struct {
+  HWND      hwnd;
+  pthread_mutex_t mu;
+  u32       w, h;
+  // the frame: w x h pixels, 0x00RRGGBB, top row first
+  u32*      pix;
+  // a frame is whole: the next paint blits all of it
+  int       stale;
+  int       wake[2];
+  u32       n, cap;
+  u32*      evs;
+  char*     copy;
+  u64       copy_len;
+  char*     paste;
+  u64       paste_len;
+  int       paste_ready;
+  char*     drop;
+  u64       drop_len;
+  // keys: the keysym each scan code went down as (0: up), so its release
+  // says the same, and whether the last key already reported its text
+  u32       down[256];
+  int       key_text;
+  // a high surrogate waiting for its low half (WM_CHAR of a character
+  // beyond the BMP)
+  u32       hi_sur;
+  _Atomic int ready, closed;
+  WCHAR*    title;
+  u32       spot_x, spot_y;
+} AppWin;
+
+static pthread_mutex_t win_qlock = PTHREAD_MUTEX_INITIALIZER;
+
+// n words (a multiple of five: whole events) onto the queue
+static void win_put_words(AppWin* a, const u32* ws, size_t n) {
+  pthread_mutex_lock(&win_qlock);
+  while ((size_t)a->n * 5 + n > (size_t)a->cap * 5) {
+    a->cap = a->cap == 0 ? 64 : a->cap * 2;
+    a->evs = io_mem(realloc(a->evs, (size_t)a->cap * 20));
+  }
+  memcpy(a->evs + (size_t)a->n * 5, ws, n * 4);
+  a->n += (u32)(n / 5);
+  pthread_mutex_unlock(&win_qlock);
+  char b = 1;
+  (void)write(a->wake[1], &b, 1);
+}
+
+static void win_push(AppWin* a, u32 kind, u32 p, u32 q, u32 r, u32 s) {
+  u32 ev[5] = { kind, p, q, r, s };
+  win_put_words(a, ev, 5);
+}
+
+// A payload: the text of one ime event, kept under its serial id until the
+// app takes it (see the header comment of the X11 window)
+typedef struct WinPayload {
+  u32 id;
+  size_t n;
+  u32* cps;
+  u8* fb;
+  struct WinPayload* next;
+} WinPayload;
+
+static WinPayload* win_pl = NULL;
+static u32 win_pl_next = 1;
+
+static u32 win_payload(const u32* cps, const u8* fb, size_t n) {
+  WinPayload* p = io_mem(calloc(1, sizeof *p));
+  p->n = n;
+  p->cps = io_mem(malloc((n ? n : 1) * 4));
+  p->fb = io_mem(malloc(n ? n : 1));
+  if (n) {
+    memcpy(p->cps, cps, n * 4);
+    if (fb) memcpy(p->fb, fb, n); else memset(p->fb, 0, n);
+  }
+  pthread_mutex_lock(&win_qlock);
+  p->id = win_pl_next++;
+  p->next = win_pl;
+  win_pl = p;
+  pthread_mutex_unlock(&win_qlock);
+  return p->id;
+}
+
+static WinPayload* win_payload_take(u32 id) {
+  pthread_mutex_lock(&win_qlock);
+  WinPayload** pp = &win_pl;
+  while (*pp != NULL && (*pp)->id != id) pp = &(*pp)->next;
+  WinPayload* p = *pp;
+  if (p != NULL) *pp = p->next;
+  pthread_mutex_unlock(&win_qlock);
+  return p;
+}
+
+// UTF-8 to code points (invalid bytes become U+FFFD); answers the count
+static size_t win_utf8(const char* s, size_t len, u32* out) {
+  size_t n = 0;
+  for (size_t i = 0; i < len;) {
+    unsigned char c = (unsigned char)s[i];
+    u32 cp = 0xfffd;
+    size_t k = 1;
+    if (c < 0x80) { cp = c; }
+    else if (c >= 0xc2 && c < 0xe0 && i + 1 < len && (s[i + 1] & 0xc0) == 0x80) {
+      cp = ((u32)(c & 0x1f) << 6) | (s[i + 1] & 0x3f); k = 2;
+    } else if (c >= 0xe0 && c < 0xf0 && i + 2 < len && (s[i + 1] & 0xc0) == 0x80 && (s[i + 2] & 0xc0) == 0x80) {
+      cp = ((u32)(c & 0x0f) << 12) | ((u32)(s[i + 1] & 0x3f) << 6) | (s[i + 2] & 0x3f); k = 3;
+      if (cp < 0x800 || (cp >= 0xd800 && cp < 0xe000)) cp = 0xfffd;
+    } else if (c >= 0xf0 && c < 0xf5 && i + 3 < len && (s[i + 1] & 0xc0) == 0x80 && (s[i + 2] & 0xc0) == 0x80 && (s[i + 3] & 0xc0) == 0x80) {
+      cp = ((u32)(c & 0x07) << 18) | ((u32)(s[i + 1] & 0x3f) << 12) | ((u32)(s[i + 2] & 0x3f) << 6) | (s[i + 3] & 0x3f); k = 4;
+      if (cp < 0x10000 || cp > 0x10ffff) cp = 0xfffd;
+    }
+    if (out) out[n] = cp;
+    n += 1;
+    i += k;
+  }
+  return n;
+}
+
+// text the input method committed: one event that owns its characters
+static void win_commit(AppWin* a, const char* s, size_t len) {
+  u32* cps = io_mem(malloc((len ? len : 1) * 4));
+  size_t n = win_utf8(s, len, cps);
+  if (n > 0) win_push(a, 14, win_payload(cps, NULL, n), 0, 0, 0);
+  free(cps);
+}
+
+// mods: 1 shift, 2 ctrl, 4 alt, 8 super
+static u32 win_mods(void) {
+  return ((GetKeyState(VK_SHIFT) < 0) ? 1u : 0)
+    | ((GetKeyState(VK_CONTROL) < 0) ? 2u : 0)
+    | ((GetKeyState(VK_MENU) < 0) ? 4u : 0)
+    | ((GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) ? 8u : 0);
+}
+
+// the X11 keysym a virtual key stands for (the app matches these)
+static u32 win_keysym(WPARAM k) {
+  switch (k) {
+    case VK_BACK: return 0xff08; case VK_TAB: return 0xff09;
+    case VK_RETURN: return 0xff0d; case VK_ESCAPE: return 0xff1b;
+    case VK_HOME: return 0xff50; case VK_LEFT: return 0xff51;
+    case VK_UP: return 0xff52; case VK_RIGHT: return 0xff53;
+    case VK_DOWN: return 0xff54; case VK_PRIOR: return 0xff55;
+    case VK_NEXT: return 0xff56; case VK_END: return 0xff57;
+    case VK_INSERT: return 0xff63; case VK_DELETE: return 0xffff;
+    default:
+      if (k >= VK_F1 && k <= VK_F24) return 0xffbe + (u32)(k - VK_F1);
+      if (k >= 'A' && k <= 'Z') return (u32)(k + 32);
+      return (u32)k;
+  }
+}
+
+// the text of a key press: its character (a control character is none)
+static u32 win_key_text(UINT vk, UINT sc) {
+  BYTE ks[256];
+  WCHAR wc[4];
+  GetKeyboardState(ks);
+  ks[VK_CONTROL] = ks[VK_LCONTROL] = ks[VK_RCONTROL] = 0;
+  ks[VK_MENU] = ks[VK_LMENU] = ks[VK_RMENU] = 0;
+  ks[VK_LWIN] = ks[VK_RWIN] = 0;
+  int n = ToUnicode(vk, sc, ks, wc, 4, 0);
+  if (n <= 0) return 0;
+  u32 cp = wc[0];
+  if (cp >= 0xd800 && cp <= 0xdbff && n > 1 && wc[1] >= 0xdc00 && wc[1] <= 0xdfff) {
+    cp = 0x10000u + ((cp - 0xd800u) << 10) + ((u32)wc[1] - 0xdc00u);
+  }
+  return cp >= 0x20 && cp != 127 ? cp : 0;
+}
+
+// file drops: a text/uri-list line per file (file:///C:/... percent-encoded)
+static size_t win_drop_uri(char* out, size_t at, const WCHAR* path) {
+  int bytes = WideCharToMultiByte(CP_UTF8, 0, path, -1, NULL, 0, NULL, NULL);
+  if (bytes <= 1) return at;
+  char* utf8 = io_mem(malloc((size_t)bytes));
+  WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, bytes, NULL, NULL);
+  size_t n = (size_t)bytes - 1, i = 0;
+  if (n >= 3 && isalpha((unsigned char)utf8[0]) && utf8[1] == ':') {
+    memcpy(out + at, "file:///", 8); at += 8;
+    out[at++] = (char)tolower((unsigned char)utf8[0]); out[at++] = '/'; i = 2;
+    while (i < n && (utf8[i] == '/' || utf8[i] == '\\')) i++;
+  } else {
+    memcpy(out + at, "file://", 7); at += 7;
+  }
+  static const char hex[] = "0123456789ABCDEF";
+  for (; i < n; i++) {
+    unsigned char c = (unsigned char)utf8[i];
+    if (c == '\\') c = '/';
+    if (isalnum(c) || c == '/' || c == ':' || c == '-' || c == '_' || c == '.' || c == '~') {
+      out[at++] = (char)c;
+    } else {
+      out[at++] = '%'; out[at++] = hex[c >> 4]; out[at++] = hex[c & 15];
+    }
+  }
+  free(utf8);
+  return at;
+}
+
+static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+  AppWin* a = (AppWin*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+  if (msg == WM_NCCREATE) {
+    CREATESTRUCTW* cs = (CREATESTRUCTW*)lp;
+    a = (AppWin*)cs->lpCreateParams;
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)a);
+    a->hwnd = hwnd;
+  }
+  if (!a) return DefWindowProcW(hwnd, msg, wp, lp);
+  switch (msg) {
+    case WM_CLOSE:
+      win_push(a, 6, 0, 0, 0, 0);
+      return 0;
+    case WM_SETFOCUS:
+      win_push(a, 12, 0, 0, 0, 0);
+      return 0;
+    case WM_KILLFOCUS:
+      for (unsigned i = 0; i < 256; i++) {
+        if (a->down[i] != 0) {
+          win_push(a, 0, a->down[i], 0, 0, i << 1);
+          a->down[i] = 0;
+        }
+      }
+      win_push(a, 11, 0, 0, 0, 0);
+      return 0;
+    case WM_SIZE: {
+      u32 w = (u32)LOWORD(lp), h = (u32)HIWORD(lp);
+      pthread_mutex_lock(&win_qlock);
+      a->w = w; a->h = h;
+      pthread_mutex_unlock(&win_qlock);
+      win_push(a, 4, w, h, 0, 0);
+      return 0;
+    }
+    case WM_PAINT: {
+      PAINTSTRUCT ps;
+      HDC dc = BeginPaint(hwnd, &ps);
+      pthread_mutex_lock(&win_qlock);
+      if (a->pix && a->w && a->h) {
+        BITMAPINFO bi;
+        memset(&bi, 0, sizeof bi);
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = (LONG)a->w;
+        bi.bmiHeader.biHeight = -(LONG)a->h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        SetDIBitsToDevice(dc, 0, 0, a->w, a->h, 0, 0, 0, a->h, a->pix, &bi, DIB_RGB_COLORS);
+      }
+      pthread_mutex_unlock(&win_qlock);
+      EndPaint(hwnd, &ps);
+      win_push(a, 5, 0, 0, 0, 0);
+      return 0;
+    }
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_KEYUP: case WM_SYSKEYUP: {
+      int down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+      UINT sc = (UINT)((lp >> 16) & 0xff);
+      if (sc >= 256) return DefWindowProcW(hwnd, msg, wp, lp);
+      if (down) {
+        u32 sym = win_keysym(wp);
+        u32 text = win_key_text((UINT)wp, sc);
+        a->down[sc] = sym;
+        a->key_text = text != 0;
+        win_push(a, 0, sym, text, win_mods(), 1u | (sc << 1));
+      } else {
+        u32 sym = a->down[sc];
+        a->down[sc] = 0;
+        if (sym != 0) win_push(a, 0, sym, 0, win_mods(), sc << 1);
+      }
+      return (msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) ? DefWindowProcW(hwnd, msg, wp, lp) : 0;
+    }
+    case WM_CHAR: {
+      // characters without a key press of their own (an input method's
+      // commit, or a character the key press already reported) are
+      // commits or nothing
+      u32 cp = (u32)wp;
+      if (cp >= 0xd800 && cp <= 0xdbff) { a->hi_sur = cp; return 0; }
+      if (cp >= 0xdc00 && cp <= 0xdfff && a->hi_sur != 0) {
+        cp = 0x10000u + ((a->hi_sur - 0xd800u) << 10) + (cp - 0xdc00u);
+      }
+      a->hi_sur = 0;
+      if (a->key_text) { a->key_text = 0; return 0; }
+      if (cp < 0x20 || cp == 127) return 0;
+      u32 one = cp;
+      win_push(a, 14, win_payload(&one, NULL, 1), 0, 0, 0);
+      return 0;
+    }
+    case WM_IME_STARTCOMPOSITION: case WM_IME_COMPOSITION: case WM_IME_ENDCOMPOSITION:
+      // preedit is not drawn yet; the composed text arrives as WM_CHAR
+      return DefWindowProcW(hwnd, msg, wp, lp);
+    case WM_MOUSEMOVE: {
+      int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+      win_push(a, 2, x < 0 ? 0 : (u32)x, y < 0 ? 0 : (u32)y, win_mods(), 0);
+      return 0;
+    }
+    case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+    case WM_RBUTTONDOWN: case WM_RBUTTONUP: {
+      u32 b = (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP) ? 1
+        : (msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP) ? 2 : 3;
+      int down = msg == WM_LBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_RBUTTONDOWN;
+      if (down) SetCapture(hwnd);
+      else if (!(wp & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON))) ReleaseCapture();
+      int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+      win_push(a, 1, x < 0 ? 0 : (u32)x, y < 0 ? 0 : (u32)y, b, down ? 1 : 0);
+      return 0;
+    }
+    case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL: {
+      POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+      ScreenToClient(hwnd, &pt);
+      int delta = GET_WHEEL_DELTA_WPARAM(wp);
+      u32 dir = msg == WM_MOUSEHWHEEL ? (delta > 0 ? 3u : 2u) : (delta > 0 ? 0u : 1u);
+      win_push(a, 3, pt.x < 0 ? 0 : (u32)pt.x, pt.y < 0 ? 0 : (u32)pt.y, dir, 0);
+      return 0;
+    }
+    case WM_DROPFILES: {
+      HDROP hd = (HDROP)wp;
+      UINT n = DragQueryFileW(hd, 0xffffffff, NULL, 0);
+      size_t cap = 1;
+      for (UINT i = 0; i < n; i++) cap += (size_t)DragQueryFileW(hd, i, NULL, 0) * 9 + 32;
+      char* out = io_mem(malloc(cap));
+      size_t used = 0;
+      for (UINT i = 0; i < n; i++) {
+        UINT len = DragQueryFileW(hd, i, NULL, 0);
+        WCHAR* path = io_mem(malloc((len + 1) * sizeof(WCHAR)));
+        DragQueryFileW(hd, i, path, len + 1);
+        used = win_drop_uri(out, used, path);
+        free(path);
+        out[used++] = '\n';
+      }
+      DragFinish(hd);
+      if (used) used--;
+      out[used] = 0;
+      pthread_mutex_lock(&win_qlock);
+      free(a->drop);
+      a->drop = out;
+      a->drop_len = used;
+      pthread_mutex_unlock(&win_qlock);
+      win_push(a, 10, 0, 0, 0, 0);
+      return 0;
+    }
+  }
+  return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void* win_thread(void* p) {
+  AppWin* a = (AppWin*)p;
+  static const WCHAR cls[] = L"BackplaneNativeWindow";
+  WNDCLASSW wc;
+  memset(&wc, 0, sizeof wc);
+  wc.lpfnWndProc = win_proc;
+  wc.hInstance = GetModuleHandleW(NULL);
+  wc.lpszClassName = cls;
+  wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+  wc.hbrBackground = NULL;
+  RegisterClassW(&wc);
+  DWORD style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+  RECT bounds = { 0, 0, (LONG)a->w, (LONG)a->h };
+  AdjustWindowRectEx(&bounds, style, FALSE, WS_EX_ACCEPTFILES);
+  HWND h = CreateWindowExW(WS_EX_ACCEPTFILES, cls, a->title, style, CW_USEDEFAULT, CW_USEDEFAULT,
+    bounds.right - bounds.left, bounds.bottom - bounds.top, NULL, NULL, wc.hInstance, a);
+  if (!h) {
+    a->closed = 1;
+    a->ready = 1;
+    char b = 1;
+    (void)write(a->wake[1], &b, 1);
+    return NULL;
+  }
+  DragAcceptFiles(h, TRUE);
+  a->ready = 1;
+  RECT rc;
+  GetClientRect(h, &rc);
+  pthread_mutex_lock(&win_qlock);
+  a->w = (u32)rc.right;
+  a->h = (u32)rc.bottom;
+  pthread_mutex_unlock(&win_qlock);
+  win_push(a, 4, (u32)rc.right, (u32)rc.bottom, 0, 0);
+  MSG m;
+  while (GetMessageW(&m, NULL, 0, 0) > 0) {
+    TranslateMessage(&m);
+    DispatchMessageW(&m);
+  }
+  a->closed = 1;
+  win_push(a, 6, 0, 0, 0, 0);
+  return NULL;
+}
+
+#ifdef CID(Win.open)
+Term win_open_run(Env e, Term* f, IoWork* w) {
+  u64 n = 0;
+  char* title = io_cstr(e, f[0], &n);
+  int code = 0;
+  AppWin* a = io_mem(calloc(1, sizeof *a));
+  a->w = (u32)f[1];
+  a->h = (u32)f[2];
+  pthread_mutex_init(&a->mu, NULL);
+  int wide = MultiByteToWideChar(CP_UTF8, 0, title, (int)n, NULL, 0);
+  a->title = io_mem(calloc((size_t)wide + 1, sizeof(WCHAR)));
+  MultiByteToWideChar(CP_UTF8, 0, title, (int)n, a->title, wide);
+  free(title);
+  if (pipe(a->wake) != 0) {
+    code = errno;
+  } else {
+    fcntl(a->wake[0], F_SETFL, O_NONBLOCK);
+    fcntl(a->wake[1], F_SETFL, O_NONBLOCK);
+    pthread_t th;
+    if (pthread_create(&th, NULL, win_thread, a) != 0) {
+      code = EIO;
+    } else {
+      pthread_detach(th);
+      while (!a->ready) Sleep(1);
+      if (a->closed) code = EIO;
+    }
+  }
+  if (code) {
+    return io_fail(e, code, "could not create the native Windows window");
+  }
+  return io_done(e, io_hand((intptr_t)a));
+}
+
+static void __attribute__((constructor)) win_open_use(void) {
+  io_eff(CID(Win.open), win_open_run);
+}
+#endif
+
+#ifdef CID(Win.words)
+static Term win_list(Env e, AppWin* a) {
+  Term list = term_pak(CID_NIL, 0);
+  pthread_mutex_lock(&win_qlock);
+  for (u64 i = (u64)a->n * 5; i > 0;) {
+    i -= 1;
+    list = io_node(e, CID_CON, (Term)a->evs[i], list);
+  }
+  a->n = 0;
+  pthread_mutex_unlock(&win_qlock);
+  char b[256];
+  while (read(a->wake[0], b, sizeof b) > 0) {}
+  return list;
+}
+
+static Term win_words_more(Env e, IoWork* w) {
+  AppWin* a = (AppWin*)w->hand;
+  pthread_mutex_lock(&win_qlock);
+  u32 pending = a->n;
+  pthread_mutex_unlock(&win_qlock);
+  if (pending == 0) {
+    return io_wait_on(w, a->wake[0], POLLIN, 0, win_words_more);
+  }
+  return io_tup(e, io_hand(w->hand), win_list(e, a));
+}
+
+Term win_words_run(Env e, Term* f, IoWork* w) {
+  w->hand = (intptr_t)io_hand_v(f[0]);
+  return win_words_more(e, w);
+}
+
+static void __attribute__((constructor)) win_words_use(void) {
+  io_eff(CID(Win.words), win_words_run);
+}
+#endif
+
+// fill the n x n region at (x, y) that lies in the w x h frame
+static void win_fill(u64* H, u32* pix, u32 w, u32 h, Term t, u32 x, u32 y, u32 n) {
+  if (x >= w || y >= h) return;
+  if (term_tag(t) == TAG_CTR && n > 1) {
+    u64 l = term_rfc(t) ? H[term_loc(t)] >> 24 : term_loc(t);
+    u32 m = n / 2;
+    win_fill(H, pix, w, h, H[l + 0], x, y, m);
+    win_fill(H, pix, w, h, H[l + 1], x + m, y, m);
+    win_fill(H, pix, w, h, H[l + 2], x, y + m, m);
+    win_fill(H, pix, w, h, H[l + 3], x + m, y + m, m);
+    return;
+  }
+  while (term_tag(t) == TAG_CTR) {
+    u64 l = term_rfc(t) ? H[term_loc(t)] >> 24 : term_loc(t);
+    t = H[l];
+  }
+  u32 c = (u32)term_loc(t) & 0xFFFFFF;
+  u32 x1 = x + n < w ? x + n : w;
+  u32 y1 = y + n < h ? y + n : h;
+  for (u32 yy = y; yy < y1; yy += 1) {
+    u32* row = pix + (size_t)yy * w;
+    for (u32 xx = x; xx < x1; xx += 1) row[xx] = c;
+  }
+}
+
+static void win_show_image(Env e, AppWin* a, Term image) {
+  io_sync();
+  pthread_mutex_lock(&win_qlock);
+  if (a->pix == NULL || a->w * a->h == 0) {
+    free(a->pix);
+    a->pix = io_mem(calloc((size_t)(a->w ? a->w : 1) * (a->h ? a->h : 1), 4));
+  }
+  u32 n = 1;
+  while (n < a->w || n < a->h) n *= 2;
+  win_fill(e.mem, a->pix, a->w, a->h, image, 0, 0, n);
+  pthread_mutex_unlock(&win_qlock);
+  if (a->hwnd) InvalidateRect(a->hwnd, NULL, FALSE);
+}
+
+#ifdef CID(Win.present)
+Term win_present_run(Env e, Term* f, IoWork* w) {
+  AppWin* a = (AppWin*)io_hand_v(f[0]);
+  win_show_image(e, a, f[1]);
+  return io_tup(e, f[0], f[1]);
+}
+
+static void __attribute__((constructor)) win_present_use(void) {
+  io_eff(CID(Win.present), win_present_run);
+}
+#endif
+
+#ifdef CID(Win.show)
+// (the whole frame is drawn each time; the previous frame is not diffed)
+Term win_show_run(Env e, Term* f, IoWork* w) {
+  AppWin* a = (AppWin*)io_hand_v(f[0]);
+  win_show_image(e, a, f[1]);
+  return io_tup(e, f[0], io_tup(e, f[1], f[2]));
+}
+
+static void __attribute__((constructor)) win_show_use(void) {
+  io_eff(CID(Win.show), win_show_run);
+}
+#endif
+
+#ifdef CID(Win.copy)
+Term win_copy_run(Env e, Term* f, IoWork* w) {
+  AppWin* a = (AppWin*)io_hand_v(f[0]);
+  free(a->copy);
+  a->copy = io_cstr(e, f[1], &a->copy_len);
+  if (OpenClipboard(a->hwnd)) {
+    EmptyClipboard();
+    int n = MultiByteToWideChar(CP_UTF8, 0, a->copy, (int)a->copy_len, NULL, 0);
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, ((size_t)n + 1) * sizeof(WCHAR));
+    if (h) {
+      WCHAR* p = GlobalLock(h);
+      MultiByteToWideChar(CP_UTF8, 0, a->copy, (int)a->copy_len, p, n);
+      p[n] = 0;
+      GlobalUnlock(h);
+      SetClipboardData(CF_UNICODETEXT, h);
+    }
+    CloseClipboard();
+  }
+  return f[0];
+}
+
+static void __attribute__((constructor)) win_copy_use(void) {
+  io_eff(CID(Win.copy), win_copy_run);
+}
+#endif
+
+#ifdef CID(Win.paste)
+// the clipboard's text is read now; the app gets it as a paste event
+Term win_paste_run(Env e, Term* f, IoWork* w) {
+  AppWin* a = (AppWin*)io_hand_v(f[0]);
+  free(a->paste);
+  a->paste = NULL;
+  a->paste_len = 0;
+  if (OpenClipboard(a->hwnd)) {
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h) {
+      WCHAR* p = GlobalLock(h);
+      if (p) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, p, -1, NULL, 0, NULL, NULL);
+        if (n > 0) {
+          a->paste = io_mem(malloc((size_t)n));
+          WideCharToMultiByte(CP_UTF8, 0, p, -1, a->paste, n, NULL, NULL);
+          a->paste_len = (u64)n - 1;
+        }
+        GlobalUnlock(h);
+      }
+    }
+    CloseClipboard();
+  }
+  a->paste_ready = 1;
+  win_push(a, 7, 0, 0, 0, 0);
+  return f[0];
+}
+
+static void __attribute__((constructor)) win_paste_use(void) {
+  io_eff(CID(Win.paste), win_paste_run);
+}
+#endif
+
+#ifdef CID(Win.pasted)
+Term win_pasted_run(Env e, Term* f, IoWork* w) {
+  AppWin* a = (AppWin*)io_hand_v(f[0]);
+  a->paste_ready = 0;
+  return io_tup(e, f[0], io_str(e, a->paste ? a->paste : "", a->paste ? a->paste_len : 0));
+}
+
+static void __attribute__((constructor)) win_pasted_use(void) {
+  io_eff(CID(Win.pasted), win_pasted_run);
+}
+#endif
+
+#ifdef CID(Win.pasted_image)
+// (pasted images are not read on Windows yet: no image, empty MIME type)
+Term win_pasted_image_run(Env e, Term* f, IoWork* w) {
+  return io_tup(e, f[0], io_tup(e, io_str(e, "", 0), io_tup(e, (Term)0, io_str(e, "", 0))));
+}
+
+static void __attribute__((constructor)) win_pasted_image_use(void) {
+  io_eff(CID(Win.pasted_image), win_pasted_image_run);
+}
+#endif
+
+#ifdef CID(Win.dropped)
+Term win_dropped_run(Env e, Term* f, IoWork* w) {
+  AppWin* a = (AppWin*)io_hand_v(f[0]);
+  return io_tup(e, f[0], io_str(e, a->drop ? a->drop : "", a->drop ? a->drop_len : 0));
+}
+
+static void __attribute__((constructor)) win_dropped_use(void) {
+  io_eff(CID(Win.dropped), win_dropped_run);
+}
+#endif
+
+#ifdef CID(Win.size)
+Term win_size_run(Env e, Term* f, IoWork* w) {
+  AppWin* a = (AppWin*)io_hand_v(f[0]);
+  return io_tup(e, f[0], io_tup(e, (Term)a->w, (Term)a->h));
+}
+
+static void __attribute__((constructor)) win_size_use(void) {
+  io_eff(CID(Win.size), win_size_run);
+}
+#endif
+
+#ifdef CID(Win.twin)
+Term win_twin_run(Env e, Term* f, IoWork* w) {
+  return io_tup(e, f[0], f[0]);
+}
+
+static void __attribute__((constructor)) win_twin_use(void) {
+  io_eff(CID(Win.twin), win_twin_run);
+}
+#endif
+
+#ifdef CID(Win.ime)
+// plain keys: the input method's preedit is not drawn on Windows yet
+Term win_ime_run(Env e, Term* f, IoWork* w) {
+  return io_tup(e, f[0], (Term)0);
+}
+
+static void __attribute__((constructor)) win_ime_use(void) {
+  io_eff(CID(Win.ime), win_ime_run);
+}
+#endif
+
+#ifdef CID(Win.payload)
+Term win_payload_run(Env e, Term* f, IoWork* w) {
+  WinPayload* p = win_payload_take((u32)f[1]);
+  size_t n = p ? p->n : 0;
+  char* out = io_mem(malloc(n * 4 + 1));
+  char* fb = io_mem(malloc(n + 1));
+  size_t k = 0;
+  for (size_t i = 0; i < n; i++) {
+    u32 c = p->cps[i];
+    if (c < 0x80) { out[k++] = (char)c; }
+    else if (c < 0x800) { out[k++] = (char)(0xc0 | (c >> 6)); out[k++] = (char)(0x80 | (c & 63)); }
+    else if (c < 0x10000) { out[k++] = (char)(0xe0 | (c >> 12)); out[k++] = (char)(0x80 | ((c >> 6) & 63)); out[k++] = (char)(0x80 | (c & 63)); }
+    else { out[k++] = (char)(0xf0 | (c >> 18)); out[k++] = (char)(0x80 | ((c >> 12) & 63)); out[k++] = (char)(0x80 | ((c >> 6) & 63)); out[k++] = (char)(0x80 | (c & 63)); }
+    fb[i] = (char)('0' + (p->fb[i] & 63));
+  }
+  Term r = io_tup(e, f[0], io_tup(e, io_str(e, out, k), io_str(e, fb, n)));
+  if (p) { free(p->cps); free(p->fb); free(p); }
+  free(out);
+  free(fb);
+  return r;
+}
+
+static void __attribute__((constructor)) win_payload_use(void) {
+  io_eff(CID(Win.payload), win_payload_run);
+}
+#endif
+
+#ifdef CID(Win.ime_reset)
+Term win_ime_reset_run(Env e, Term* f, IoWork* w) {
+  return f[0];
+}
+
+static void __attribute__((constructor)) win_ime_reset_use(void) {
+  io_eff(CID(Win.ime_reset), win_ime_reset_run);
+}
+#endif
+
+#ifdef CID(Win.ime_spot)
+Term win_ime_spot_run(Env e, Term* f, IoWork* w) {
+  AppWin* a = (AppWin*)io_hand_v(f[0]);
+  a->spot_x = (u32)f[1];
+  a->spot_y = (u32)f[2];
+  return f[0];
+}
+
+static void __attribute__((constructor)) win_ime_spot_use(void) {
+  io_eff(CID(Win.ime_spot), win_ime_spot_run);
+}
+#endif
+
+#ifdef CID(Win.ime_inject)
+// queue what the input method would (tests): kind 0 a commit of the text,
+// 1 a preedit replaced whole by it, 2 the preedit done
+Term win_ime_inject_run(Env e, Term* f, IoWork* w) {
+  AppWin* a = (AppWin*)io_hand_v(f[0]);
+  u64 len = 0;
+  char* t = io_cstr(e, f[2], &len);
+  u32 kind = (u32)f[1];
+  if (kind == 0) {
+    win_commit(a, t, (size_t)len);
+  } else if (kind == 1) {
+    u32* cps = io_mem(malloc((len ? len : 1) * 4));
+    u8* fbs = io_mem(malloc(len ? len : 1));
+    size_t n = win_utf8(t, (size_t)len, cps);
+    memset(fbs, 2, n);
+    win_push(a, 15, 0, 0, win_payload(cps, fbs, n), (u32)n);
+    free(cps);
+    free(fbs);
+  } else {
+    win_push(a, 18, 0, 0, 0, 0);
+  }
+  free(t);
+  return f[0];
+}
+
+static void __attribute__((constructor)) win_ime_inject_use(void) {
+  io_eff(CID(Win.ime_inject), win_ime_inject_run);
+}
+#endif
+
+#ifdef CID(Win.title)
+Term win_title_run(Env e, Term* f, IoWork* w) {
+  AppWin* a = (AppWin*)io_hand_v(f[0]);
+  u64 n = 0;
+  char* t = io_cstr(e, f[1], &n);
+  int wide = MultiByteToWideChar(CP_UTF8, 0, t, (int)n, NULL, 0);
+  WCHAR* ws = io_mem(calloc((size_t)wide + 1, sizeof(WCHAR)));
+  MultiByteToWideChar(CP_UTF8, 0, t, (int)n, ws, wide);
+  if (a->hwnd) SetWindowTextW(a->hwnd, ws);
+  free(ws);
+  free(t);
+  return f[0];
+}
+
+static void __attribute__((constructor)) win_title_use(void) {
+  io_eff(CID(Win.title), win_title_run);
+}
+#endif
+
 #else
 
 // No window on this platform yet (macOS gets its own AppKit twin).

@@ -18,6 +18,79 @@
 
 extern char** environ;
 
+#if defined(__MSYS__)
+// MSYS2 has waitpid but not waitid(WNOWAIT). Keep the exit status when the
+// polling Proc.exited reaps a child, so a later Proc.wait can still return it.
+typedef struct HostExit HostExit;
+struct HostExit {
+  pid_t pid;
+  uint32_t code;
+  HostExit* next;
+};
+static HostExit* host_exits;
+static pthread_mutex_t host_exits_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t host_exit_code(int st) {
+  return WIFEXITED(st) ? (uint32_t)WEXITSTATUS(st) : 128u + (uint32_t)WTERMSIG(st);
+}
+
+static uint32_t host_proc_wait(pid_t pid) {
+  pthread_mutex_lock(&host_exits_mu);
+  HostExit** at = &host_exits;
+  while (*at != NULL && (*at)->pid != pid) {
+    at = &(*at)->next;
+  }
+  if (*at != NULL) {
+    HostExit* got = *at;
+    uint32_t code = got->code;
+    *at = got->next;
+    free(got);
+    pthread_mutex_unlock(&host_exits_mu);
+    return code;
+  }
+  int st = 0;
+  pid_t r;
+  do {
+    r = waitpid(pid, &st, 0);
+  } while (r < 0 && errno == EINTR);
+  uint32_t code = r < 0 ? 255u : host_exit_code(st);
+  pthread_mutex_unlock(&host_exits_mu);
+  return code;
+}
+
+static uint32_t host_proc_exited(pid_t pid) {
+  pthread_mutex_lock(&host_exits_mu);
+  for (HostExit* at = host_exits; at != NULL; at = at->next) {
+    if (at->pid == pid) {
+      uint32_t code = at->code;
+      pthread_mutex_unlock(&host_exits_mu);
+      return code;
+    }
+  }
+  int st = 0;
+  pid_t r;
+  do {
+    r = waitpid(pid, &st, WNOHANG);
+  } while (r < 0 && errno == EINTR);
+  uint32_t code = r == 0 ? 4294967295u : r < 0 ? 255u : host_exit_code(st);
+  if (r > 0) {
+    HostExit* got = (HostExit*)malloc(sizeof *got);
+    if (got != NULL) {
+      got->pid = pid;
+      got->code = code;
+      got->next = host_exits;
+      host_exits = got;
+    }
+  }
+  pthread_mutex_unlock(&host_exits_mu);
+  return code;
+}
+#endif
+
+#if defined(__MSYS__)
+#include <pthread.h>
+#endif
+
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
@@ -596,12 +669,16 @@ static void __attribute__((constructor)) proc_errtail_use(void) {
 #ifdef CID(Proc.wait)
 
 static void proc_wait_call(IoWork* w) {
+#if defined(__MSYS__)
+  w->made = host_proc_wait((pid_t)w->word);
+#else
   int st = 0;
   pid_t r;
   do {
     r = waitpid((pid_t)w->word, &st, 0);
   } while (r < 0 && errno == EINTR);
   w->made = r < 0 ? 255 : WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+#endif
 }
 
 static Term proc_wait_pack(Env e, IoWork* w) {
@@ -625,6 +702,9 @@ static void __attribute__((constructor)) proc_wait_use(void) {
 // Proc.exited: the exit code of a child that has exited (left unreaped:
 // WNOWAIT), 4294967295 while it runs; one already reaped reads 255.
 Term proc_exited_run(Env e, Term* f, IoWork* w) {
+#if defined(__MSYS__)
+  return (Term)host_proc_exited((pid_t)(uint32_t)f[0]);
+#else
   siginfo_t si;
   memset(&si, 0, sizeof si);
   int r = waitid(P_PID, (id_t)(uint32_t)f[0], &si, WEXITED | WNOHANG | WNOWAIT);
@@ -637,6 +717,7 @@ Term proc_exited_run(Env e, Term* f, IoWork* w) {
     code = si.si_code == CLD_EXITED ? (uint32_t)si.si_status : 128u + (uint32_t)si.si_status;
   }
   return (Term)code;
+#endif
 }
 
 static void __attribute__((constructor)) proc_exited_use(void) {
