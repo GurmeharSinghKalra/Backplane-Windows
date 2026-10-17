@@ -1,3 +1,5 @@
+> **Windows (MSYS2) port, 2026-10-17: working first pass, not finished.** The hub, the web client and Claude and Codex agents run natively on Windows; the native window, terminal, phone pairing and more are untested or missing. See [docs/WINDOWS.md](docs/WINDOWS.md) for what works, what does not, the build steps and the bugs found.
+
 # Backplane
 
 Agentic hardware development. Claude Code, Codex, Grok, Muse Code and Google's Antigravity work on your KiCad boards and FreeCAD parts, and every change they make is drawn live beside the conversation, in a browser, on your phone, or in the desktop app.

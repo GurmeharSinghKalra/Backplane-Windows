@@ -1818,8 +1818,9 @@ typedef struct {
   HWND      hwnd;
   pthread_mutex_t mu;
   u32       w, h;
-  // the frame: w x h pixels, 0x00RRGGBB, top row first
+  // the frame: pix_w x pix_h pixels, 0x00RRGGBB, top row first
   u32*      pix;
+  u32       pix_w, pix_h;
   // a frame is whole: the next paint blits all of it
   int       stale;
   int       wake[2];
@@ -2044,7 +2045,7 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       PAINTSTRUCT ps;
       HDC dc = BeginPaint(hwnd, &ps);
       pthread_mutex_lock(&win_qlock);
-      if (a->pix && a->w && a->h) {
+      if (a->pix && a->pix_w && a->pix_h && a->pix_w == a->w && a->pix_h == a->h) {
         BITMAPINFO bi;
         memset(&bi, 0, sizeof bi);
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -2296,9 +2297,12 @@ static void win_fill(u64* H, u32* pix, u32 w, u32 h, Term t, u32 x, u32 y, u32 n
 static void win_show_image(Env e, AppWin* a, Term image) {
   io_sync();
   pthread_mutex_lock(&win_qlock);
-  if (a->pix == NULL || a->w * a->h == 0) {
+  // (the buffer follows the window: a resize must not leave it too small)
+  if (a->pix == NULL || a->pix_w != a->w || a->pix_h != a->h) {
     free(a->pix);
     a->pix = io_mem(calloc((size_t)(a->w ? a->w : 1) * (a->h ? a->h : 1), 4));
+    a->pix_w = a->w;
+    a->pix_h = a->h;
   }
   u32 n = 1;
   while (n < a->w || n < a->h) n *= 2;

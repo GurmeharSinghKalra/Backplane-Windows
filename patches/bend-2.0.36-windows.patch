@@ -1,0 +1,176 @@
+diff --git a/bend2/bend.ts b/bend2/bend.ts
+index 0a0814a..2698e8f 100644
+--- a/bend2/bend.ts
++++ b/bend2/bend.ts
+@@ -958,7 +958,8 @@ export async function book_load(book: Book, file: string, ns: string, seen: Map<
+     return book.order.length;
+   }
+   seen.set(real, null);
+-  const dir   = real.slice(0, real.lastIndexOf("/") + 1);
++  // (on Windows real has backslashes; the imports below are posix paths)
++  const dir   = path.dirname(real).replace(/\\/g, "/") + "/";
+   const top   = root ?? dir;
+   const text  = fs.readFileSync(real, "utf8");
+   const lines = text.split("\n");
+@@ -999,8 +1000,9 @@ export async function book_load(book: Book, file: string, ns: string, seen: Map<
+     if (!ok(as.replace(/^\.\//, "").slice(0, -5), hub(as))) {
+       throw bad();
+     }
+-    const got = await book_file(book, hub(as) ? BEND_LIB + "/" + rel : path.posix.resolve(dir, rel), sp);
+-    const lib = fs.existsSync(BEND_LIB) ? fs.realpathSync(BEND_LIB) + "/" : "\0";
++    // (realpath gives backslashes on Windows; the names below are posix)
++    const got = (await book_file(book, hub(as) ? BEND_LIB + "/" + rel : path.resolve(dir, rel).replace(/\\/g, "/"), sp)).replace(/\\/g, "/");
++    const lib = fs.existsSync(BEND_LIB) ? fs.realpathSync(BEND_LIB).replace(/\\/g, "/") + "/" : "\0";
+     const sub = (got.startsWith(lib) ? got.slice(lib.length)
+       : path.posix.relative(top, got)).replace(/\.bend$/, "");
+     if (!ok(sub, got.startsWith(lib)) || (hub(ns) && !got.startsWith(lib))) {
+diff --git a/bend2/comp.ts b/bend2/comp.ts
+index ee934d4..c291749 100644
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -2791,6 +2791,8 @@ export function compile_book(book: Bend.Book): string {
+   let was: number;
+   do {
+     was = facts();
++    // Windows builds use Bun; collect between passes to keep large books within RAM.
++    if (typeof Bun !== 'undefined') Bun.gc(true);
+     [FL.lend, FL.spun, FL.clos, FL.tabs, FL.lits, FL.consts, FL.brws]
+       .forEach((m) => m.clear());
+     FL.segs = [];
+@@ -3294,6 +3296,9 @@ using namespace metal;
+ #include <time.h>
+ #include <poll.h>
+ #include <sys/select.h>
++#if defined(__MSYS__)
++#include <windows.h>
++#endif
+ #ifdef __APPLE__
+ #include <mach-o/dyld.h>
+ #endif
+@@ -3352,7 +3357,9 @@ using namespace metal;
+ #define BARD()  \
+   { __threadfence(); __syncthreads(); }
+ #else
+-#if __has_attribute(preserve_none) && __has_attribute(preserve_most) \
++#if defined(__MSYS__)
++#define PRESERVE(A) __attribute__((sysv_abi))
++#elif __has_attribute(preserve_none) && __has_attribute(preserve_most) \
+   && defined(__OPTIMIZE__)
+ #define PRESERVE(A) __attribute__((A))
+ #else
+@@ -4336,6 +4343,9 @@ static const WlFn wl_tab[] = { WL_TABLE };
+ #undef WL_X
+ #endif
+ 
++#if defined(__MSYS__)
++__attribute__((sysv_abi))
++#endif
+ static Term work_loop(Env e, DEV Term* sp, Term t, u32 seq) {
+   WL_BANK
+   u32 rn = 0;
+@@ -4695,11 +4705,13 @@ static Term* pool_stack(void) {
+   if (mprotect(p + len, 16384, PROT_NONE) != 0) {
+     err_fail("stack guard failed");
+   }
++#if !defined(__MSYS__)
+   stack_t ss = { .ss_sp = p + len + 16384, .ss_size = SIGSTKSZ };
+   sigaltstack(&ss, NULL);
+   struct sigaction sa = { .sa_handler = err_trap, .sa_flags = SA_ONSTACK };
+   sigaction(SIGSEGV, &sa, NULL);
+   sigaction(SIGBUS, &sa, NULL);
++#endif
+   return (Term*)p;
+ }
+ 
+@@ -5218,6 +5230,34 @@ static void cube_run(u64* H, bool gpu) {
+ 
+ static u64 corpus_size;
+ 
++#if defined(__MSYS__)
++static atomic_uintptr_t corpus_base;
++static atomic_uintptr_t corpus_limit;
++
++static LONG CALLBACK corpus_fault(EXCEPTION_POINTERS* e) {
++  if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
++    return EXCEPTION_CONTINUE_SEARCH;
++  }
++  uintptr_t p = (uintptr_t)e->ExceptionRecord->ExceptionInformation[1];
++  uintptr_t lo = atomic_load_explicit(&corpus_base, memory_order_acquire);
++  uintptr_t hi = atomic_load_explicit(&corpus_limit, memory_order_acquire);
++  if (p < lo || p >= hi) {
++    return EXCEPTION_CONTINUE_SEARCH;
++  }
++  SYSTEM_INFO si;
++  GetSystemInfo(&si);
++  uintptr_t page = p & ~((uintptr_t)si.dwPageSize - 1);
++  return VirtualAlloc((void*)page, si.dwPageSize, MEM_COMMIT, PAGE_READWRITE) == (void*)page
++    ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
++}
++
++static void corpus_fault_install(void) {
++  if (AddVectoredExceptionHandler(1, corpus_fault) == NULL) {
++    err_fail("arena fault handler failed");
++  }
++}
++#endif
++
+ static void* corpus_map(u64 size) {
+   u64   hint = 1ull << 45;
+   void* p    = pool_try((void*)hint, size);
+@@ -5231,6 +5271,11 @@ static void* corpus_map(u64 size) {
+   if (p == MAP_FAILED) {
+     err_fail("reservation failed");
+   }
++#if defined(__MSYS__)
++  atomic_store_explicit(&corpus_base, (uintptr_t)p, memory_order_release);
++  atomic_store_explicit(&corpus_limit, (uintptr_t)p + size, memory_order_release);
++  corpus_fault_install();
++#endif
+   return p;
+ }
+ 
+@@ -5260,8 +5305,12 @@ static bool corpus_grow(u64* H, u64 need) {
+     char* at   = (char*)H + more;
+     void* got  = io_gpu || more >= 1ull << 43 ? MAP_FAILED
+       : pool_try(at, more);
++
+     ok = got == at;
+     if (ok) {
++#if defined(__MSYS__)
++      atomic_store_explicit(&corpus_limit, (uintptr_t)H + more * 2, memory_order_release);
++#endif
+       corpus_lay(H, more * 2);
+     } else if (got != MAP_FAILED) {
+       munmap(got, more);
+diff --git a/bend2/effs/random_u32.c b/bend2/effs/random_u32.c
+index 034fc0e..ca9fbc0 100644
+--- a/bend2/effs/random_u32.c
++++ b/bend2/effs/random_u32.c
+@@ -1,7 +1,11 @@
+ // IO
+ // ==
+ 
+-#ifdef __linux__
++#if defined(_WIN32) || defined(__MSYS__)
++#include <windows.h>
++#include <bcrypt.h>
++#include <errno.h>
++#elif defined(__linux__)
+ #include <sys/random.h>
+ #endif
+ 
+@@ -11,9 +15,14 @@ static void io_random_u32_call(IoWork* w) {
+ #ifdef __APPLE__
+   arc4random_buf(&w->word, sizeof(w->word));
+   w->code = 0;
++#else
++#if defined(_WIN32) || defined(__MSYS__)
++  NTSTATUS s = BCryptGenRandom(NULL, (PUCHAR)&w->word, sizeof(w->word), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
++  w->code = s == 0 ? 0 : EIO;
+ #else
+   io_sys_end(w, getrandom(&w->word, sizeof(w->word), 0));
+ #endif
++#endif
+ }
+ 
+ static Term io_random_u32_pack(Env e, IoWork* w) {
