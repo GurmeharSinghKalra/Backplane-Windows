@@ -1,0 +1,3 @@
+
+# the Bend patch must stay LF so `git apply` works on Windows checkouts
+patches/bend-2.0.36-windows.patch text eol=lf
